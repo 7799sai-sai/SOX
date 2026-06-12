@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: keystone-sox-api
+    runtime: node
+    rootDir: backend
+    buildCommand: npm install
+    startCommand: npm start
+    plan: free
+    envVars:
+      - key: JWT_SECRET
+        generateValue: true
+      - key: CORS_ORIGIN
+        value: https://7799sai-sai.github.io
+      - key: DB_PATH
+        value: /opt/render/project/src/keystone.db
+      - key: NODE_ENV
+        value: production

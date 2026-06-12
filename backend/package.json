@@ -1,0 +1,20 @@
+{
+  "name": "keystone-sox-backend",
+  "version": "1.0.0",
+  "description": "Per-user workspace API for the KEYSTONE ICFR/SOX 404 Command Centre",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "better-sqlite3": "^9.4.3",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

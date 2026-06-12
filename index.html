@@ -6878,5 +6878,288 @@ else init();
   }catch(err){ try{ console.error('KX-P34 init error', err); }catch(e){} } });
 })();
 </script>
+
+<!-- ═══════════════════════════════════════════════════════════════════
+     KEYSTONE — Backend Auth & Per-User Sync  (injected module)
+     Each user's workspace is isolated on the server; localStorage
+     is kept as an offline-first cache / fallback.
+     ═══════════════════════════════════════════════════════════════════ -->
+<style>
+/* ── auth overlay ─────────────────────────────────────────────────── */
+#kx-auth-overlay{
+  position:fixed;inset:0;z-index:9999;
+  background:var(--bg,#f5f6fa);
+  display:flex;align-items:center;justify-content:center;
+  font-family:'DM Sans',system-ui,sans-serif;
+}
+[data-theme=dark] #kx-auth-overlay{background:#0f1117;}
+#kx-auth-box{
+  width:100%;max-width:390px;
+  background:var(--surface,#fff);
+  border:1px solid var(--border,#e0e2ea);
+  border-radius:12px;padding:32px 28px;
+  box-shadow:0 8px 40px rgba(0,0,0,.14);
+}
+[data-theme=dark] #kx-auth-box{background:#1a1d24;border-color:#2a2d38;}
+.kx-auth-logo{display:flex;align-items:center;gap:10px;margin-bottom:22px;}
+.kx-auth-logo .mark{width:34px;height:34px;border-radius:8px;background:var(--accent,#4f6ef7);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:17px;flex-shrink:0;}
+.kx-auth-logo .nm{font-weight:700;font-size:15px;color:var(--text,#1a1d24);}
+[data-theme=dark] .kx-auth-logo .nm{color:#e8eaf0;}
+.kx-auth-logo .sb{font-size:11px;opacity:.55;margin-top:1px;}
+#kx-auth-title{font-size:19px;font-weight:700;margin:0 0 4px;color:var(--text,#1a1d24);}
+[data-theme=dark] #kx-auth-title{color:#e8eaf0;}
+#kx-auth-sub{font-size:13px;color:var(--text-faint,#666);margin:0 0 22px;line-height:1.5;}
+.kx-field{margin-bottom:14px;}
+.kx-field label{display:block;font-size:11.5px;font-weight:700;color:var(--text-faint,#555);margin-bottom:5px;text-transform:uppercase;letter-spacing:.05em;}
+.kx-field input{
+  width:100%;box-sizing:border-box;padding:9px 12px;
+  border:1.5px solid var(--border,#dde0ea);border-radius:7px;
+  font-size:14px;font-family:inherit;
+  background:var(--bg,#f5f6fa);color:var(--text,#1a1d24);
+  outline:none;transition:border .15s;
+}
+.kx-field input:focus{border-color:var(--accent,#4f6ef7);}
+[data-theme=dark] .kx-field input{background:#0f1117;border-color:#2a2d38;color:#e8eaf0;}
+#kx-auth-btn{
+  width:100%;padding:10px;margin-top:6px;
+  background:var(--accent,#4f6ef7);color:#fff;
+  border:none;border-radius:7px;
+  font-size:14px;font-weight:600;font-family:inherit;
+  cursor:pointer;transition:opacity .15s;
+}
+#kx-auth-btn:hover{opacity:.88;}
+#kx-auth-btn:disabled{opacity:.55;cursor:default;}
+#kx-auth-err{color:#d94040;font-size:13px;margin-top:10px;min-height:18px;text-align:center;}
+.kx-auth-foot{margin-top:16px;text-align:center;font-size:13px;color:var(--text-faint,#777);}
+.kx-auth-foot a{color:var(--accent,#4f6ef7);cursor:pointer;font-weight:600;text-decoration:none;}
+/* ── user pill in topbar ─────────────────────────────────────────── */
+#kx-user-pill{
+  display:flex;align-items:center;gap:8px;padding:0 6px;
+  font-size:12px;color:var(--text-faint,#666);
+  max-width:180px;overflow:hidden;
+}
+#kx-user-email{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#kx-logout-btn{
+  flex-shrink:0;font-size:11px;padding:3px 8px;
+  border:1px solid var(--border,#dde0ea);border-radius:4px;
+  background:transparent;color:var(--text-faint,#666);
+  cursor:pointer;font-family:inherit;transition:all .15s;
+}
+#kx-logout-btn:hover{background:#d94040;color:#fff;border-color:#d94040;}
+</style>
+
+<!-- Auth overlay — hidden once the user is authenticated -->
+<div id="kx-auth-overlay">
+  <div id="kx-auth-box">
+    <div class="kx-auth-logo">
+      <div class="mark">K</div>
+      <div>
+        <div class="nm">KEYSTONE</div>
+        <div class="sb">ICFR / SOX 404 Command Centre</div>
+      </div>
+    </div>
+    <h2 id="kx-auth-title">Sign in</h2>
+    <p id="kx-auth-sub">Your workspace is saved to your account and private to you.</p>
+    <div class="kx-field">
+      <label for="kx-email">Email</label>
+      <input type="email" id="kx-email" autocomplete="email" placeholder="you@company.com">
+    </div>
+    <div class="kx-field">
+      <label for="kx-pass">Password</label>
+      <input type="password" id="kx-pass" autocomplete="current-password" placeholder="••••••••">
+    </div>
+    <button id="kx-auth-btn">Sign in</button>
+    <div id="kx-auth-err"></div>
+    <div class="kx-auth-foot" id="kx-auth-foot">
+      No account? <a id="kx-auth-switch">Register</a>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  /* ── backend URL ─────────────────────────────────────────────────────
+     Update RENDER_URL after you deploy the backend to Render.com.
+     ─────────────────────────────────────────────────────────────────── */
+  var RENDER_URL   = 'https://keystone-sox-api.onrender.com';
+  var BACKEND      = (location.hostname === 'localhost' || location.hostname === '127.0.0.1')
+    ? 'http://localhost:3001'
+    : RENDER_URL;
+
+  var TOKEN_KEY    = 'kx_auth_token';
+  var USER_KEY     = 'kx_auth_email';
+  var WS_KEY       = window.STORAGE_KEY || 'keystone_icfr_workspace_v1';
+
+  /* ── tiny helpers ────────────────────────────────────────────────── */
+  function api(method, path, body, token) {
+    var opts = {
+      method: method,
+      headers: { 'Content-Type': 'application/json' }
+    };
+    if (token) opts.headers['Authorization'] = 'Bearer ' + token;
+    if (body)  opts.body = JSON.stringify(body);
+    return fetch(BACKEND + path, opts)
+      .then(function (r) {
+        return r.json().then(function (d) { d.__status = r.status; return d; });
+      });
+  }
+
+  function lsGet(k)  { try { return localStorage.getItem(k); }    catch(e) { return null; } }
+  function lsSet(k,v){ try { localStorage.setItem(k, v); }         catch(e) {} }
+  function lsDel(k)  { try { localStorage.removeItem(k); }         catch(e) {} }
+
+  /* ── overlay refs ────────────────────────────────────────────────── */
+  var overlay   = document.getElementById('kx-auth-overlay');
+  var errEl     = document.getElementById('kx-auth-err');
+  var btn       = document.getElementById('kx-auth-btn');
+  var titleEl   = document.getElementById('kx-auth-title');
+  var subEl     = document.getElementById('kx-auth-sub');
+  var footEl    = document.getElementById('kx-auth-foot');
+  var mode      = 'login';
+
+  function setError(msg) { errEl.textContent = msg || ''; }
+
+  /* ── update overlay text for login vs register ───────────────────── */
+  function applyMode(m) {
+    mode = m;
+    if (m === 'login') {
+      titleEl.textContent = 'Sign in';
+      subEl.textContent   = 'Your workspace is saved to your account and private to you.';
+      btn.textContent     = 'Sign in';
+      footEl.innerHTML    = 'No account? <a id="kx-auth-switch">Register</a>';
+    } else {
+      titleEl.textContent = 'Create account';
+      subEl.textContent   = 'Create an account to save your workspace — only you can see your data.';
+      btn.textContent     = 'Create account';
+      footEl.innerHTML    = 'Already registered? <a id="kx-auth-switch">Sign in</a>';
+    }
+    document.getElementById('kx-auth-switch')
+      .addEventListener('click', function () { setError(''); applyMode(mode === 'login' ? 'register' : 'login'); });
+    document.getElementById('kx-auth-switch').style.cursor = 'pointer';
+    setError('');
+  }
+
+  /* ── hide overlay + wire up user pill & save patch ──────────────── */
+  function onAuthSuccess() {
+    overlay.style.display = 'none';
+    addUserPill();
+    patchSaveWorkspace();
+  }
+
+  function addUserPill() {
+    var credit = document.getElementById('topbar-credit');
+    if (!credit || document.getElementById('kx-user-pill')) return;
+    var pill = document.createElement('div');
+    pill.id = 'kx-user-pill';
+    pill.innerHTML =
+      '<span id="kx-user-email" title="' + (lsGet(USER_KEY) || '') + '">' +
+        (lsGet(USER_KEY) || '') +
+      '</span>' +
+      '<button id="kx-logout-btn" title="Sign out">Sign out</button>';
+    credit.parentNode.insertBefore(pill, credit);
+    document.getElementById('kx-logout-btn').addEventListener('click', function () {
+      if (confirm('Sign out of KEYSTONE?\n\nYour workspace remains saved on the server.')) {
+        lsDel(TOKEN_KEY);
+        lsDel(USER_KEY);
+        location.reload();
+      }
+    });
+  }
+
+  /* ── patch saveWorkspace to also push to backend (debounced 2 s) ── */
+  function patchSaveWorkspace() {
+    if (typeof window.saveWorkspace !== 'function') return;
+    var orig = window.saveWorkspace;
+    window.saveWorkspace = function (now) {
+      orig.apply(this, arguments);
+      clearTimeout(window._kxSyncTimer);
+      window._kxSyncTimer = setTimeout(function () {
+        var token = lsGet(TOKEN_KEY);
+        if (!token || !window.state || !window.state.ws) return;
+        api('PUT', '/api/workspace', { state: window.state.ws }, token)
+          .catch(function () { /* offline — localStorage is the fallback */ });
+      }, 2000);
+    };
+  }
+
+  /* ── pull workspace from backend → write to localStorage → re-render */
+  function syncFromBackend(token, cb) {
+    api('GET', '/api/workspace', null, token)
+      .then(function (data) {
+        if (data.__status === 200 && data.state) {
+          lsSet(WS_KEY, JSON.stringify(data.state));
+        }
+        cb(true);
+      })
+      .catch(function () { cb(false); /* offline — use local data */ });
+  }
+
+  /* ── re-render the app with freshly written localStorage data ────── */
+  function rerenderApp() {
+    if (typeof window.loadWorkspace === 'function') window.loadWorkspace();
+    if (typeof window.route === 'function' && window.state) {
+      window.route(window.state.activeModule || 'overview');
+    }
+  }
+
+  /* ── register / login ────────────────────────────────────────────── */
+  function doAuth() {
+    var email = (document.getElementById('kx-email').value || '').trim();
+    var pass  = document.getElementById('kx-pass').value || '';
+    if (!email || !pass) { setError('Please enter your email and password.'); return; }
+    btn.disabled = true;
+    setError('');
+    var path = mode === 'register' ? '/api/register' : '/api/login';
+    api('POST', path, { email: email, password: pass })
+      .then(function (data) {
+        btn.disabled = false;
+        if (data.token) {
+          lsSet(TOKEN_KEY, data.token);
+          lsSet(USER_KEY, data.email);
+          syncFromBackend(data.token, function () {
+            rerenderApp();
+            onAuthSuccess();
+          });
+        } else {
+          setError(data.error || 'Authentication failed — please try again.');
+        }
+      })
+      .catch(function () {
+        btn.disabled = false;
+        setError('Cannot reach the server. Check your connection.');
+      });
+  }
+
+  /* ── bind form events ────────────────────────────────────────────── */
+  btn.addEventListener('click', doAuth);
+  ['kx-email', 'kx-pass'].forEach(function (id) {
+    document.getElementById(id).addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') doAuth();
+    });
+  });
+  applyMode('login');
+
+  /* ── auto-login if a token is already stored ─────────────────────── */
+  var storedToken = lsGet(TOKEN_KEY);
+  if (storedToken) {
+    titleEl.textContent = 'Loading your workspace…';
+    subEl.textContent   = '';
+    btn.textContent     = 'Please wait…';
+    btn.disabled        = true;
+    footEl.innerHTML    = '';
+    syncFromBackend(storedToken, function (ok) {
+      if (ok) {
+        rerenderApp();
+        onAuthSuccess();
+      } else {
+        /* backend unreachable — let user in with local data */
+        onAuthSuccess();
+      }
+    });
+  }
+})();
+</script>
 </body>
 </html>
