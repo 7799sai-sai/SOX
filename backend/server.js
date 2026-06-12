@@ -6,7 +6,7 @@ const jwt      = require('jsonwebtoken');
 const cors     = require('cors');
 const path     = require('path');
 
-require('dotenv').config();
+try { require('dotenv').config(); } catch(e) { /* env vars set directly on Render */ }
 
 const app    = express();
 const PORT   = process.env.PORT || 3001;
