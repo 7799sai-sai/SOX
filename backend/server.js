@@ -1,26 +1,40 @@
 'use strict';
-const express   = require('express');
-const Database  = require('better-sqlite3');
-const bcrypt    = require('bcryptjs');
-const jwt       = require('jsonwebtoken');
-const cors      = require('cors');
-const helmet    = require('helmet');
-const rateLimit = require('express-rate-limit');
-const path      = require('path');
+const express     = require('express');
+const Database    = require('better-sqlite3');
+const bcrypt      = require('bcryptjs');
+const jwt         = require('jsonwebtoken');
+const cors        = require('cors');
+const helmet      = require('helmet');
+const rateLimit   = require('express-rate-limit');
+const compression = require('compression');
+const crypto      = require('crypto');
+const fs          = require('fs');
+const path        = require('path');
 
 try { require('dotenv').config(); } catch(e) { /* env vars set directly on Render */ }
 
-const app         = express();
-const PORT        = process.env.PORT        || 3001;
-const SECRET      = process.env.JWT_SECRET  || 'keystone-dev-secret-CHANGE-IN-PRODUCTION';
-const DB_PATH     = process.env.DB_PATH     || path.join(__dirname, 'keystone.db');
-const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
+const app              = express();
+const PORT             = process.env.PORT             || 3001;
+const SECRET           = process.env.JWT_SECRET       || 'keystone-dev-secret-CHANGE-IN-PRODUCTION';
+const DB_PATH          = process.env.DB_PATH          || path.join(__dirname, 'keystone.db');
+const CORS_ORIGIN      = process.env.CORS_ORIGIN      || '*';
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+const ADMIN_EMAILS     = (process.env.ADMIN_EMAILS || '')
+  .split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
+const VERSION          = '2.1.0';
+const SNAPSHOT_MIN_INTERVAL_MIN = 10;
+
+// Render terminates TLS at its proxy; needed for correct client IPs in rate limiting
+app.set('trust proxy', 1);
 
 // ── security headers ──────────────────────────────────────────────────────────
 app.use(helmet({
   crossOriginResourcePolicy: { policy: 'cross-origin' },
   contentSecurityPolicy: false  // frontend is on a different origin
 }));
+
+// ── gzip responses (workspace JSON can be hundreds of KB) ────────────────────
+app.use(compression());
 
 // ── CORS ─────────────────────────────────────────────────────────────────────
 app.use(cors({ origin: CORS_ORIGIN, credentials: true }));
@@ -45,9 +59,10 @@ const apiLimiter = rateLimit({
   message: { error: 'Too many requests — please slow down.' }
 });
 
-app.use('/api/login',    authLimiter);
-app.use('/api/register', authLimiter);
-app.use('/api/',         apiLimiter);
+app.use('/api/login',       authLimiter);
+app.use('/api/register',    authLimiter);
+app.use('/api/auth/google', authLimiter);
+app.use('/api/',            apiLimiter);
 
 // ── database ──────────────────────────────────────────────────────────────────
 const db = new Database(DB_PATH);
@@ -96,10 +111,14 @@ function makeRefreshToken(userId, email) {
   return jwt.sign({ userId, email, type: 'refresh' }, SECRET, { expiresIn: '30d' });
 }
 
+function tokenFingerprint(token) {
+  return crypto.createHash('sha256').update(token).digest('hex');
+}
+
 function storeRefreshToken(userId, token) {
   const payload = jwt.decode(token);
   const expiresAt = new Date(payload.exp * 1000).toISOString();
-  const hash = Buffer.from(token).toString('base64').slice(-32); // simple fingerprint
+  const hash = tokenFingerprint(token);
   db.prepare(`
     INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)
   `).run(userId, hash, expiresAt);
@@ -112,6 +131,16 @@ function storeRefreshToken(userId, token) {
 }
 
 function saveSnapshot(userId, stateJson) {
+  // throttle: saves arrive every few seconds, but backups are only useful if
+  // they span hours — skip when the newest snapshot is recent
+  const latest = db.prepare(`
+    SELECT saved_at FROM workspace_snapshots
+    WHERE user_id = ? ORDER BY id DESC LIMIT 1
+  `).get(userId);
+  if (latest) {
+    const ageMin = (Date.now() - new Date(latest.saved_at + 'Z').getTime()) / 60000;
+    if (ageMin < SNAPSHOT_MIN_INTERVAL_MIN) return;
+  }
   db.prepare(`
     INSERT INTO workspace_snapshots (user_id, state_json) VALUES (?, ?)
   `).run(userId, stateJson);
@@ -154,7 +183,14 @@ function requireAuth(req, res, next) {
 app.get('/api/health', (_req, res) => res.json({
   ok: true,
   ts: new Date().toISOString(),
-  version: '2.0.0'
+  uptime: Math.round(process.uptime()),
+  version: VERSION
+}));
+
+// Public config — lets the frontend discover optional features
+app.get('/api/config', (_req, res) => res.json({
+  googleClientId: GOOGLE_CLIENT_ID || null,
+  version: VERSION
 }));
 
 // Register
@@ -237,6 +273,67 @@ app.post('/api/refresh', (req, res) => {
   }
 });
 
+// Logout — revoke the presented refresh token (or all sessions with all:true)
+app.post('/api/logout', requireAuth, (req, res) => {
+  const { refreshToken, all } = req.body || {};
+  if (all === true) {
+    db.prepare('DELETE FROM refresh_tokens WHERE user_id = ?').run(req.user.userId);
+  } else if (refreshToken) {
+    db.prepare('DELETE FROM refresh_tokens WHERE user_id = ? AND token_hash = ?')
+      .run(req.user.userId, tokenFingerprint(refreshToken));
+  }
+  res.json({ ok: true });
+});
+
+// Sign in with Google — verifies a Google Identity Services ID token.
+// Enabled only when GOOGLE_CLIENT_ID is configured.
+app.post('/api/auth/google', async (req, res) => {
+  if (!GOOGLE_CLIENT_ID) {
+    return res.status(501).json({ error: 'Google sign-in is not configured on this server' });
+  }
+  const { credential } = req.body || {};
+  if (!credential || typeof credential !== 'string') {
+    return res.status(400).json({ error: 'credential (Google ID token) is required' });
+  }
+  try {
+    const r = await fetch(
+      'https://oauth2.googleapis.com/tokeninfo?id_token=' + encodeURIComponent(credential)
+    );
+    if (!r.ok) {
+      return res.status(401).json({ error: 'Google token could not be verified' });
+    }
+    const info = await r.json();
+    if (info.aud !== GOOGLE_CLIENT_ID) {
+      return res.status(401).json({ error: 'Google token audience mismatch' });
+    }
+    if (info.email_verified !== 'true' && info.email_verified !== true) {
+      return res.status(401).json({ error: 'Google account email is not verified' });
+    }
+    const emailClean = String(info.email || '').trim().toLowerCase();
+    if (!validateEmail(emailClean)) {
+      return res.status(401).json({ error: 'Google token has no valid email' });
+    }
+    let user = db.prepare('SELECT id, email FROM users WHERE email = ?').get(emailClean);
+    if (!user) {
+      // Google-only account: store an unguessable random hash so password
+      // login stays effectively disabled until the user sets one
+      const randomHash = bcrypt.hashSync(crypto.randomBytes(32).toString('hex'), 12);
+      const { lastInsertRowid } = db
+        .prepare('INSERT INTO users (email, password_hash) VALUES (?, ?)')
+        .run(emailClean, randomHash);
+      user = { id: lastInsertRowid, email: emailClean };
+    }
+    db.prepare("UPDATE users SET last_login_at = datetime('now') WHERE id = ?").run(user.id);
+    const accessToken  = makeAccessToken(user.id, user.email);
+    const refreshToken = makeRefreshToken(user.id, user.email);
+    storeRefreshToken(user.id, refreshToken);
+    res.json({ token: accessToken, refreshToken, email: user.email });
+  } catch (err) {
+    console.error('Google auth error:', err);
+    res.status(502).json({ error: 'Could not verify Google token — please try again' });
+  }
+});
+
 // Change password
 app.post('/api/change-password', requireAuth, (req, res) => {
   const { currentPassword, newPassword } = req.body || {};
@@ -270,18 +367,31 @@ app.get('/api/workspace', requireAuth, (req, res) => {
   }
 });
 
-// Save (upsert) workspace state + auto-snapshot
+// Save (upsert) workspace state + auto-snapshot + conflict detection
 app.put('/api/workspace', requireAuth, (req, res) => {
-  const { state } = req.body || {};
+  const { state, baseUpdatedAt } = req.body || {};
   if (!state || typeof state !== 'object') {
     return res.status(400).json({ error: 'A valid state object is required' });
   }
   try {
     const json = JSON.stringify(state);
-    // save snapshot before overwriting (Phase 2 — versioning)
     const existing = db
-      .prepare('SELECT state_json FROM workspaces WHERE user_id = ?')
+      .prepare('SELECT state_json, updated_at FROM workspaces WHERE user_id = ?')
       .get(req.user.userId);
+
+    // conflict detection: the client says which server version its edits are
+    // based on; if another device saved since then, let the client decide
+    if (existing && baseUpdatedAt && existing.updated_at !== baseUpdatedAt) {
+      let serverState = null;
+      try { serverState = JSON.parse(existing.state_json); } catch {}
+      return res.status(409).json({
+        error: 'Workspace was changed on another device',
+        serverUpdatedAt: existing.updated_at,
+        serverState
+      });
+    }
+
+    // save snapshot before overwriting (Phase 2 — versioning)
     if (existing) saveSnapshot(req.user.userId, existing.state_json);
 
     db.prepare(`
@@ -291,7 +401,10 @@ app.put('/api/workspace', requireAuth, (req, res) => {
         state_json = excluded.state_json,
         updated_at = excluded.updated_at
     `).run(req.user.userId, json);
-    res.json({ ok: true });
+    const row = db
+      .prepare('SELECT updated_at FROM workspaces WHERE user_id = ?')
+      .get(req.user.userId);
+    res.json({ ok: true, updated_at: row.updated_at });
   } catch (err) {
     console.error('Workspace save error:', err);
     res.status(500).json({ error: 'Could not save workspace' });
@@ -305,6 +418,20 @@ app.get('/api/workspace/snapshots', requireAuth, (req, res) => {
     WHERE user_id = ? ORDER BY id DESC LIMIT 5
   `).all(req.user.userId);
   res.json({ snapshots: rows });
+});
+
+// Fetch one snapshot's full state (preview / download before restoring)
+app.get('/api/workspace/snapshots/:id', requireAuth, (req, res) => {
+  const snap = db.prepare(`
+    SELECT id, state_json, saved_at FROM workspace_snapshots
+    WHERE id = ? AND user_id = ?
+  `).get(req.params.id, req.user.userId);
+  if (!snap) return res.status(404).json({ error: 'Snapshot not found' });
+  try {
+    res.json({ id: snap.id, saved_at: snap.saved_at, state: JSON.parse(snap.state_json) });
+  } catch {
+    res.status(500).json({ error: 'Snapshot is corrupt' });
+  }
 });
 
 // Restore a specific snapshot (Phase 2)
@@ -321,7 +448,10 @@ app.post('/api/workspace/snapshots/:id/restore', requireAuth, (req, res) => {
         state_json = excluded.state_json,
         updated_at = excluded.updated_at
     `).run(req.user.userId, snap.state_json);
-    res.json({ ok: true, state: JSON.parse(snap.state_json) });
+    const row = db
+      .prepare('SELECT updated_at FROM workspaces WHERE user_id = ?')
+      .get(req.user.userId);
+    res.json({ ok: true, state: JSON.parse(snap.state_json), updated_at: row.updated_at });
   } catch (err) {
     res.status(500).json({ error: 'Could not restore snapshot' });
   }
@@ -333,12 +463,31 @@ app.delete('/api/workspace', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
+// Admin stats — only for emails listed in ADMIN_EMAILS (Phase 5)
+app.get('/api/admin/stats', requireAuth, (req, res) => {
+  if (!ADMIN_EMAILS.includes((req.user.email || '').toLowerCase())) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  let dbSizeBytes = 0;
+  try { dbSizeBytes = fs.statSync(DB_PATH).size; } catch {}
+  res.json({
+    users:          db.prepare('SELECT COUNT(*) AS n FROM users').get().n,
+    workspaces:     db.prepare('SELECT COUNT(*) AS n FROM workspaces').get().n,
+    totalSnapshots: db.prepare('SELECT COUNT(*) AS n FROM workspace_snapshots').get().n,
+    dbSizeBytes,
+    uptime: Math.round(process.uptime()),
+    version: VERSION
+  });
+});
+
 // ── 404 catch-all ─────────────────────────────────────────────────────────────
 app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
 
 // ── start ─────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`Keystone SOX backend v2 listening on port ${PORT}`);
-  console.log(`CORS origin: ${CORS_ORIGIN}`);
-  console.log(`Database:    ${DB_PATH}`);
+  console.log(`Keystone SOX backend v${VERSION} listening on port ${PORT}`);
+  console.log(`CORS origin:    ${CORS_ORIGIN}`);
+  console.log(`Database:       ${DB_PATH}`);
+  console.log(`Google sign-in: ${GOOGLE_CLIENT_ID ? 'enabled' : 'disabled (set GOOGLE_CLIENT_ID)'}`);
+  console.log(`Admin emails:   ${ADMIN_EMAILS.length ? ADMIN_EMAILS.join(', ') : 'none (set ADMIN_EMAILS)'}`);
 });

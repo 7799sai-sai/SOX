@@ -1633,6 +1633,7 @@ function renderSettings(c){
         '<div id="restore-preview"></div>'+
         '<div class="hr"></div>'+
         '<details style="margin-bottom:10px"><summary class="faint" style="cursor:pointer;font-size:12px">Plain JSON (no manifest)</summary><div class="row" style="margin-top:8px;gap:8px"><button class="btn btn-sm" id="data-export">Export plain workspace JSON</button><input type="file" id="data-import" accept="application/json,.json" style="display:none"><button class="btn btn-sm" id="data-import-btn">Import plain JSON</button></div></details>'+
+        '<div class="row" style="margin-bottom:10px;gap:8px"><button class="btn btn-sm" id="data-cloud">☁ Cloud backups & account</button></div>'+
         '<button class="btn btn-danger" id="data-reset"><span class="ic">⟲</span>Reset workspace</button>'+
         '<div class="note" style="margin-top:12px">Backups embed a SHA-256 manifest; on restore the payload is re-hashed and compared so tampering or corruption is detected. Restore migrates older schema versions automatically. Reset clears all local data and cannot be undone.</div>'+
       '</div></div>'+
@@ -1697,6 +1698,7 @@ function bindSettings(){
   on('data-import-btn','click',function(){ $('#data-import').click(); });
   on('data-import','change',importWorkspace);
   on('data-reset','click',resetWorkspace);
+  on('data-cloud','click',function(){ if(window.kxOpenAccountDrawer)window.kxOpenAccountDrawer(); else toast('Cloud sync is not active in this session','warn'); });
   on('set-logo-btn','click',function(){ var fe=$('#set-logo-file'); if(fe)fe.click(); });
   on('set-logo-file','change',function(ev){ var file=ev.target.files&&ev.target.files[0]; if(!file)return; if(file.size>600000){ toast('Logo too large (max ~600 KB)','err'); ev.target.value=''; return; } var rd=new FileReader(); rd.onload=function(){ state.ws.settings.org.logo=rd.result; saveWorkspace(); logAction('settings.logo','set'); toast('Logo set','ok'); renderSettings($('#content')); }; rd.readAsDataURL(file); });
   on('set-logo-clr','click',function(){ state.ws.settings.org.logo=''; saveWorkspace(); logAction('settings.logo','removed'); toast('Logo removed','ok'); renderSettings($('#content')); });
@@ -6950,6 +6952,21 @@ else init();
   font-size:11px;white-space:nowrap;flex-shrink:0;
   transition:color .3s;
 }
+#kx-user-email{cursor:pointer;}
+#kx-user-email:hover{text-decoration:underline;}
+/* ── Google sign-in divider ──────────────────────────────────────── */
+.kx-divider{display:flex;align-items:center;gap:10px;margin:16px 0 12px;color:var(--text-faint,#999);font-size:12px;}
+.kx-divider::before,.kx-divider::after{content:'';flex:1;height:1px;background:var(--border,#e0e2ea);}
+#kx-gsi-btn{display:flex;justify-content:center;}
+/* ── account drawer bits ─────────────────────────────────────────── */
+.kx-snap-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border:1px solid var(--border,#e0e2ea);border-radius:7px;margin-bottom:6px;font-size:13px;}
+.kx-acct-msg{font-size:12.5px;min-height:16px;margin-top:6px;}
+.kx-acct-msg.ok{color:#22a559;}
+.kx-acct-msg.err{color:#d94040;}
+.kx-stat-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;}
+.kx-stat{border:1px solid var(--border,#e0e2ea);border-radius:7px;padding:8px 10px;}
+.kx-stat .v{font-size:17px;font-weight:700;}
+.kx-stat .l{font-size:11px;opacity:.6;}
 </style>
 
 <!-- Auth overlay — hidden once the user is authenticated -->
@@ -6994,18 +7011,33 @@ else init();
   var USER_KEY     = 'kx_auth_email';
   var WS_KEY       = window.STORAGE_KEY || 'keystone_icfr_workspace_v1';
 
+  /* sync bookkeeping */
+  var serverUpdatedAt = null;   // server's updated_at for the version we last saw
+  var pendingPush     = false;  // a push failed (offline) — retry when back online
+
   /* ── tiny helpers ────────────────────────────────────────────────── */
-  function api(method, path, body, token) {
+  function api(method, path, body, token, extra) {
     var opts = {
       method: method,
       headers: { 'Content-Type': 'application/json' }
     };
     if (token) opts.headers['Authorization'] = 'Bearer ' + token;
     if (body)  opts.body = JSON.stringify(body);
+    if (extra) for (var k in extra) opts[k] = extra[k];
     return fetch(BACKEND + path, opts)
       .then(function (r) {
         return r.json().then(function (d) { d.__status = r.status; return d; });
       });
+  }
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c];
+    });
+  }
+
+  function appToast(msg, type) {
+    if (typeof window.toast === 'function') { try { window.toast(msg, type); return; } catch (e) {} }
   }
 
   function lsGet(k)  { try { return localStorage.getItem(k); }    catch(e) { return null; } }
@@ -7107,18 +7139,230 @@ else init();
     var pill = document.createElement('div');
     pill.id = 'kx-user-pill';
     pill.innerHTML =
-      '<span id="kx-user-email" title="' + (lsGet(USER_KEY) || '') + '">' +
-        (lsGet(USER_KEY) || '') +
-      '</span>' +
+      '<span id="kx-user-email" title="Account, backups & security">' + esc(lsGet(USER_KEY) || '') + '</span>' +
       '<span id="kx-sync-status"></span>' +
       '<button id="kx-logout-btn" title="Sign out">Sign out</button>';
     credit.parentNode.insertBefore(pill, credit);
+    document.getElementById('kx-user-email').addEventListener('click', openAccountDrawer);
     document.getElementById('kx-logout-btn').addEventListener('click', function () {
       if (confirm('Sign out of KEYSTONE?\n\nYour workspace remains saved on the server.')) {
-        clearAuth();
-        location.reload();
+        signOut(false);
       }
     });
+  }
+
+  function signOut(everywhere) {
+    var token = lsGet(TOKEN_KEY);
+    var body  = everywhere ? { all: true } : { refreshToken: lsGet(REFRESH_KEY) };
+    function done() { clearAuth(); location.reload(); }
+    if (!token) { done(); return; }
+    api('POST', '/api/logout', body, token).then(done).catch(done);
+  }
+
+  /* ── account drawer (backups, password, sessions) ─────────────────── */
+  function fmtTime(iso) {
+    if (!iso) return '—';
+    try {
+      var d = new Date(/Z|[+-]\d\d:?\d\d$/.test(iso) ? iso : iso.replace(' ', 'T') + 'Z');
+      return d.toLocaleString();
+    } catch (e) { return iso; }
+  }
+
+  function openAccountDrawer() {
+    var old = document.getElementById('drawer-overlay');
+    if (old && old.parentNode) old.parentNode.removeChild(old);
+
+    var ov = document.createElement('div');
+    ov.className = 'drawer-overlay';
+    ov.id = 'drawer-overlay';
+    ov.innerHTML =
+      '<div class="drawer"><div class="drawer-head"><div>' +
+        '<div class="dh-t">Account</div><div class="dh-s">' + esc(lsGet(USER_KEY) || '') + '</div></div>' +
+        '<button class="ia" id="drawer-x" title="Close">✕</button></div>' +
+      '<div class="drawer-body">' +
+        '<div class="dsec first">Sync</div>' +
+        '<div style="font-size:13px;margin-bottom:8px">Last synced: <strong id="kx-acct-synced">' + esc(fmtTime(serverUpdatedAt)) + '</strong></div>' +
+        '<button class="btn btn-sm" id="kx-acct-sync">Sync now</button>' +
+        '<div class="dsec">Cloud backups</div>' +
+        '<div style="font-size:12px;opacity:.65;margin-bottom:8px">Automatic server-side backups of your workspace (kept: last 5, at least 10 minutes apart). Restoring replaces your current workspace.</div>' +
+        '<div id="kx-snap-list" style="font-size:13px;opacity:.7">Loading…</div>' +
+        '<div class="dsec">Change password</div>' +
+        '<div class="kx-field"><label>Current password</label><input type="password" id="kx-cp-cur" autocomplete="current-password"></div>' +
+        '<div class="kx-field"><label>New password (min 8 chars)</label><input type="password" id="kx-cp-new" autocomplete="new-password"></div>' +
+        '<button class="btn btn-sm" id="kx-cp-btn">Change password</button>' +
+        '<div class="kx-acct-msg" id="kx-cp-msg"></div>' +
+        '<div id="kx-admin-wrap" style="display:none"><div class="dsec">Server stats (admin)</div><div class="kx-stat-grid" id="kx-admin-stats"></div></div>' +
+      '</div>' +
+      '<div class="drawer-foot">' +
+        '<button class="btn btn-danger" id="kx-acct-signout-all" title="Revoke every signed-in session">Sign out everywhere</button>' +
+        '<button class="btn" id="kx-acct-signout" style="margin-left:auto">Sign out</button>' +
+      '</div></div>';
+    document.body.appendChild(ov);
+    requestAnimationFrame(function () { ov.classList.add('show'); });
+
+    function close() {
+      ov.classList.remove('show');
+      setTimeout(function () { if (ov.parentNode) ov.parentNode.removeChild(ov); }, 180);
+    }
+    ov.addEventListener('click', function (e) { if (e.target === ov) close(); });
+    document.getElementById('drawer-x').addEventListener('click', close);
+
+    document.getElementById('kx-acct-sync').addEventListener('click', function () {
+      pushWorkspace({ cb: function (ok) {
+        var s = document.getElementById('kx-acct-synced');
+        if (s && ok) s.textContent = fmtTime(serverUpdatedAt);
+        appToast(ok ? 'Workspace synced' : 'Sync failed — check your connection', ok ? 'ok' : 'err');
+      }});
+    });
+
+    document.getElementById('kx-acct-signout').addEventListener('click', function () { signOut(false); });
+    document.getElementById('kx-acct-signout-all').addEventListener('click', function () {
+      if (confirm('Sign out on ALL devices?\n\nEvery signed-in session will need to log in again.')) signOut(true);
+    });
+
+    document.getElementById('kx-cp-btn').addEventListener('click', function () {
+      var cur = document.getElementById('kx-cp-cur').value;
+      var nw  = document.getElementById('kx-cp-new').value;
+      var msg = document.getElementById('kx-cp-msg');
+      msg.className = 'kx-acct-msg';
+      if (!cur || !nw)   { msg.className += ' err'; msg.textContent = 'Both fields are required.'; return; }
+      if (nw.length < 8) { msg.className += ' err'; msg.textContent = 'New password must be at least 8 characters.'; return; }
+      getValidToken(function (token) {
+        if (!token) { msg.className += ' err'; msg.textContent = 'Session expired — sign in again.'; return; }
+        api('POST', '/api/change-password', { currentPassword: cur, newPassword: nw }, token)
+          .then(function (d) {
+            if (d.__status === 200) {
+              msg.className += ' ok';
+              msg.textContent = 'Password changed. Signing you out everywhere…';
+              setTimeout(function () { clearAuth(); location.reload(); }, 1800);
+            } else {
+              msg.className += ' err';
+              msg.textContent = d.error || 'Could not change password.';
+            }
+          })
+          .catch(function () { msg.className += ' err'; msg.textContent = 'Cannot reach the server.'; });
+      });
+    });
+
+    loadSnapshots();
+    loadAdminStats();
+  }
+  window.kxOpenAccountDrawer = openAccountDrawer;
+
+  function loadSnapshots() {
+    getValidToken(function (token) {
+      var list = document.getElementById('kx-snap-list');
+      if (!list) return;
+      if (!token) { list.textContent = 'Sign in to view backups.'; return; }
+      api('GET', '/api/workspace/snapshots', null, token)
+        .then(function (d) {
+          if (!list.isConnected) return;
+          if (d.__status !== 200 || !d.snapshots) { list.textContent = 'Could not load backups.'; return; }
+          if (!d.snapshots.length) { list.textContent = 'No backups yet — they appear after your first edits.'; return; }
+          list.innerHTML = d.snapshots.map(function (s) {
+            return '<div class="kx-snap-row"><span>' + esc(fmtTime(s.saved_at)) + '</span>' +
+              '<button class="btn btn-sm" data-snap="' + s.id + '">Restore</button></div>';
+          }).join('');
+          list.addEventListener('click', function (e) {
+            var b = e.target.closest('[data-snap]');
+            if (!b) return;
+            if (!confirm('Restore this backup?\n\nYour current workspace will be replaced (the server keeps it as a new backup first).')) return;
+            restoreSnapshot(b.getAttribute('data-snap'), b);
+          });
+        })
+        .catch(function () { list.textContent = 'Cannot reach the server.'; });
+    });
+  }
+
+  function restoreSnapshot(id, btn) {
+    btn.disabled = true;
+    getValidToken(function (token) {
+      if (!token) { btn.disabled = false; return; }
+      api('POST', '/api/workspace/snapshots/' + encodeURIComponent(id) + '/restore', {}, token)
+        .then(function (d) {
+          btn.disabled = false;
+          if (d.__status === 200 && d.state) {
+            lsSet(WS_KEY, JSON.stringify(d.state));
+            serverUpdatedAt = d.updated_at || null;
+            rerenderApp();
+            appToast('Backup restored', 'ok');
+            var s = document.getElementById('kx-acct-synced');
+            if (s) s.textContent = fmtTime(serverUpdatedAt);
+          } else {
+            appToast(d.error || 'Could not restore backup', 'err');
+          }
+        })
+        .catch(function () { btn.disabled = false; appToast('Cannot reach the server', 'err'); });
+    });
+  }
+
+  function loadAdminStats() {
+    getValidToken(function (token) {
+      if (!token) return;
+      api('GET', '/api/admin/stats', null, token)
+        .then(function (d) {
+          if (d.__status !== 200) return; // not an admin — section stays hidden
+          var wrap = document.getElementById('kx-admin-wrap');
+          var grid = document.getElementById('kx-admin-stats');
+          if (!wrap || !grid) return;
+          grid.innerHTML =
+            '<div class="kx-stat"><div class="v">' + esc(d.users) + '</div><div class="l">Users</div></div>' +
+            '<div class="kx-stat"><div class="v">' + esc(d.workspaces) + '</div><div class="l">Workspaces</div></div>' +
+            '<div class="kx-stat"><div class="v">' + esc(d.totalSnapshots) + '</div><div class="l">Backups</div></div>' +
+            '<div class="kx-stat"><div class="v">' + esc((d.dbSizeBytes / 1048576).toFixed(2)) + ' MB</div><div class="l">Database</div></div>';
+          wrap.style.display = '';
+        })
+        .catch(function () {});
+    });
+  }
+
+  /* ── Google sign-in (renders only when the server has a client ID) ── */
+  function initGoogleSignIn() {
+    api('GET', '/api/config', null)
+      .then(function (cfg) {
+        if (!cfg || !cfg.googleClientId || document.getElementById('kx-gsi-wrap')) return;
+        var box = document.getElementById('kx-auth-box');
+        if (!box) return;
+        var wrap = document.createElement('div');
+        wrap.id = 'kx-gsi-wrap';
+        wrap.innerHTML = '<div class="kx-divider"><span>or</span></div><div id="kx-gsi-btn"></div>';
+        box.insertBefore(wrap, footEl);
+        var s = document.createElement('script');
+        s.src = 'https://accounts.google.com/gsi/client';
+        s.async = true;
+        s.onload = function () {
+          try {
+            window.google.accounts.id.initialize({
+              client_id: cfg.googleClientId,
+              callback: function (resp) {
+                if (!resp || !resp.credential) return;
+                setError('');
+                api('POST', '/api/auth/google', { credential: resp.credential })
+                  .then(function (data) {
+                    if (data.token) {
+                      lsSet(TOKEN_KEY, data.token);
+                      lsSet(REFRESH_KEY, data.refreshToken || '');
+                      lsSet(USER_KEY, data.email);
+                      syncFromBackend(data.token, function () {
+                        rerenderApp();
+                        onAuthSuccess();
+                      });
+                    } else {
+                      setError(data.error || 'Google sign-in failed — please try again.');
+                    }
+                  })
+                  .catch(function () { setError('Cannot reach the server. Check your connection.'); });
+              }
+            });
+            window.google.accounts.id.renderButton(
+              document.getElementById('kx-gsi-btn'),
+              { theme: 'outline', size: 'large', width: 320, text: 'continue_with' }
+            );
+          } catch (e) { /* GIS unavailable — email/password still works */ }
+        };
+        document.head.appendChild(s);
+      })
+      .catch(function () { /* backend asleep/offline — email form still works */ });
   }
 
   function setSyncStatus(text, ok) {
@@ -7126,6 +7370,74 @@ else init();
     if (!el) return;
     el.textContent = text;
     el.style.color = ok === false ? '#d94040' : ok === true ? '#22a559' : '#999';
+  }
+
+  /* ── push workspace to backend (conflict-aware) ──────────────────── */
+  function pushWorkspace(opts) {
+    opts = opts || {};
+    if (!window.state || !window.state.ws) return;
+    setSyncStatus('Syncing…', null);
+
+    function send(token) {
+      if (!token) { setSyncStatus('Offline', false); pendingPush = true; return; }
+      var body = { state: window.state.ws };
+      if (!opts.force && serverUpdatedAt) body.baseUpdatedAt = serverUpdatedAt;
+      api('PUT', '/api/workspace', body, token, opts.keepalive ? { keepalive: true } : null)
+        .then(function (d) {
+          if (d.__status === 200) {
+            serverUpdatedAt = d.updated_at || serverUpdatedAt;
+            pendingPush = false;
+            setSyncStatus('Saved ✓', true);
+            setTimeout(function () { setSyncStatus('', null); }, 3000);
+            if (opts.cb) opts.cb(true);
+          } else if (d.__status === 409) {
+            handleConflict(d);
+          } else if (d.__status === 401 && !opts._retried) {
+            opts._retried = true;
+            refreshAccessToken(function (newToken) {
+              if (newToken) { send(newToken); }
+              else { setSyncStatus('Session expired', false); }
+            });
+          } else if (d.__status === 401) {
+            setSyncStatus('Session expired', false);
+          } else {
+            setSyncStatus('Sync failed', false);
+            if (opts.cb) opts.cb(false);
+          }
+        })
+        .catch(function () {
+          setSyncStatus('Offline', false);
+          pendingPush = true;
+          if (opts.cb) opts.cb(false);
+        });
+    }
+
+    if (opts.keepalive) {
+      // page is closing — no time for an async token refresh
+      send(lsGet(TOKEN_KEY));
+    } else {
+      getValidToken(send);
+    }
+  }
+
+  function handleConflict(d) {
+    setSyncStatus('Conflict', false);
+    var useServer = confirm(
+      'This workspace was changed on another device.\n\n' +
+      'OK     — load the newer version from the server (unsynced changes here are discarded)\n' +
+      'Cancel — keep this version and overwrite the server copy'
+    );
+    if (useServer && d.serverState) {
+      lsSet(WS_KEY, JSON.stringify(d.serverState));
+      serverUpdatedAt = d.serverUpdatedAt || null;
+      rerenderApp();
+      appToast('Loaded the latest version from your other device', 'info');
+      setSyncStatus('Saved ✓', true);
+      setTimeout(function () { setSyncStatus('', null); }, 3000);
+    } else {
+      pushWorkspace({ force: true });
+      appToast('Server copy overwritten with this version', 'warn');
+    }
   }
 
   /* ── patch saveWorkspace to also sync to backend (debounced 2 s) ── */
@@ -7136,28 +7448,38 @@ else init();
       orig.apply(this, arguments);
       clearTimeout(window._kxSyncTimer);
       window._kxSyncTimer = setTimeout(function () {
-        if (!window.state || !window.state.ws) return;
-        setSyncStatus('Syncing…', null);
-        getValidToken(function (token) {
-          if (!token) { setSyncStatus('Offline', false); return; }
-          api('PUT', '/api/workspace', { state: window.state.ws }, token)
-            .then(function (d) {
-              if (d.__status === 200) {
-                setSyncStatus('Saved ✓', true);
-                setTimeout(function () { setSyncStatus('', null); }, 3000);
-              } else if (d.__status === 401) {
-                setSyncStatus('Session expired', false);
-              } else {
-                setSyncStatus('Sync failed', false);
-              }
-            })
-            .catch(function () { setSyncStatus('Offline', false); });
-        });
+        window._kxSyncTimer = null;
+        pushWorkspace();
       }, 2000);
     };
   }
 
+  /* ── flush pending sync when the tab is hidden / closing ─────────── */
+  function flushPending() {
+    if (window._kxSyncTimer) {
+      clearTimeout(window._kxSyncTimer);
+      window._kxSyncTimer = null;
+      pushWorkspace({ keepalive: true });
+    }
+  }
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'hidden') flushPending();
+  });
+  window.addEventListener('pagehide', flushPending);
+
+  /* ── retry the last failed push once we're back online ───────────── */
+  window.addEventListener('online', function () {
+    if (pendingPush) pushWorkspace();
+  });
+
   /* ── pull workspace from backend → localStorage → re-render ─────── */
+  function applyPulled(data) {
+    if (data.__status === 200 && data.state) {
+      lsSet(WS_KEY, JSON.stringify(data.state));
+      serverUpdatedAt = data.updated_at || null;
+    }
+  }
+
   function syncFromBackend(token, cb) {
     api('GET', '/api/workspace', null, token)
       .then(function (data) {
@@ -7165,15 +7487,12 @@ else init();
           refreshAccessToken(function (newToken) {
             if (!newToken) { cb(false, true); return; }
             api('GET', '/api/workspace', null, newToken)
-              .then(function (d2) {
-                if (d2.__status === 200 && d2.state) lsSet(WS_KEY, JSON.stringify(d2.state));
-                cb(true);
-              })
+              .then(function (d2) { applyPulled(d2); cb(true); })
               .catch(function () { cb(false); });
           });
           return;
         }
-        if (data.__status === 200 && data.state) lsSet(WS_KEY, JSON.stringify(data.state));
+        applyPulled(data);
         cb(true);
       })
       .catch(function () { cb(false); });
@@ -7222,6 +7541,7 @@ else init();
     });
   });
   applyMode('login');
+  initGoogleSignIn();
 
   /* ── auto-login with stored token ───────────────────────────────── */
   var storedToken = lsGet(TOKEN_KEY);
